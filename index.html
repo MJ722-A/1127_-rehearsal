@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>날씨 & 기분 기록장</title>
+<style>
+  body { font-family: sans-serif; max-width: 520px; margin: 30px auto; padding: 0 16px; background: #f4f7fb; }
+  .card { background: #fff; padding: 20px; border-radius: 12px; margin-bottom: 16px; box-shadow: 0 2px 6px rgba(0,0,0,.08); }
+  input, select, button { padding: 10px; margin: 4px 0; font-size: 15px; width: 100%; box-sizing: border-box; }
+  button { background: #3b82f6; color: #fff; border: 0; border-radius: 8px; cursor: pointer; }
+  button.del { background: #ef4444; width: auto; padding: 6px 10px; }
+  .err { color: #dc2626; font-size: 14px; min-height: 18px; }
+  .item { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #eee; padding: 8px 0; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+
+<!-- 로그인 화면 -->
+<div id="loginView" class="card">
+  <h2>🔐 로그인</h2>
+  <input id="email" type="email" placeholder="이메일">
+  <input id="pw" type="password" placeholder="비밀번호">
+  <button id="loginBtn">로그인</button>
+  <div id="loginErr" class="err"></div>
+</div>
+
+<!-- 메인 화면 -->
+<div id="mainView" class="hidden">
+  <div class="card">
+    <span id="userEmail"></span>
+    <button id="logoutBtn" style="margin-top:8px">로그아웃</button>
+  </div>
+
+  <div class="card">
+    <h2>🌤️ 현재 날씨</h2>
+    <select id="city">
+      <option value="37.5665,126.9780,서울">서울</option>
+      <option value="35.1796,129.0756,부산">부산</option>
+      <option value="33.4996,126.5312,제주">제주</option>
+      <option value="35.8714,128.6014,대구">대구</option>
+    </select>
+    <button id="weatherBtn">날씨 조회</button>
+    <div id="weatherResult">조회 버튼을 눌러주세요.</div>
+  </div>
+
+  <div class="card">
+    <h2>📝 오늘의 기분</h2>
+    <select id="mood">
+      <option>😀 좋음</option>
+      <option>😐 보통</option>
+      <option>😢 우울</option>
+      <option>😡 화남</option>
+    </select>
+    <input id="memo" placeholder="한 줄 기록">
+    <button id="saveBtn">저장</button>
+    <div id="saveErr" class="err"></div>
+  </div>
+
+  <div class="card">
+    <h2>📚 내 기록</h2>
+    <div id="list"></div>
+  </div>
+</div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getFirestore, collection, addDoc, deleteDoc, doc, query, orderBy, onSnapshot, serverTimestamp }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+// ★ 본인의 firebaseConfig
+const firebaseConfig = {
+  apiKey: "AIzaSyBUkDrTxQC_jfP8FmBu07DGP2nmVBclJ0Y",
+  authDomain: "myproject-bb02c.firebaseapp.com",
+  projectId: "myproject-bb02c",
+  storageBucket: "myproject-bb02c.firebasestorage.app",
+  messagingSenderId: "185920574841",
+  appId: "1:185920574841:web:dfe0fa2e1e7a036695cba8"
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const $ = id => document.getElementById(id);
+
+let unsubscribe = null;
+let lastWeather = "";
+
+// ---- 날씨 코드 → 한글 ----
+function codeToText(c) {
+  if (c === 0) return "맑음 ☀️";
+  if (c <= 3) return "구름 ⛅";
+  if (c <= 48) return "안개 🌫️";
+  if (c <= 67) return "비 🌧️";
+  if (c <= 77) return "눈 ❄️";
+  if (c <= 82) return "소나기 🌦️";
+  return "뇌우 ⛈️";
+}
+
+// ---- 로그인 / 로그아웃 ----
+$("loginBtn").onclick = async () => {
+  $("loginErr").textContent = "";
+  try {
+    await signInWithEmailAndPassword(auth, $("email").value.trim(), $("pw").value);
+  } catch (e) {
+    $("loginErr").textContent = "로그인 실패: 이메일 또는 비밀번호를 확인하세요. (" + e.code + ")";
+  }
+};
+$("logoutBtn").onclick = () => signOut(auth);
+
+// ---- 로그인 상태에 따라 화면 전환 ----
+onAuthStateChanged(auth, user => {
+  if (user) {
+    $("loginView").classList.add("hidden");
+    $("mainView").classList.remove("hidden");
+    $("userEmail").textContent = "👤 " + user.email;
+    loadList(user.uid);
+  } else {
+    if (unsubscribe) unsubscribe();
+    $("mainView").classList.add("hidden");
+    $("loginView").classList.remove("hidden");
+  }
+});
+
+// ---- Open-Meteo 날씨 조회 ----
+$("weatherBtn").onclick = async () => {
+  const [lat, lon, name] = $("city").value.split(",");
+  $("weatherResult").textContent = "불러오는 중...";
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,weather_code`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    const t = data.current.temperature_2m;
+    const w = codeToText(data.current.weather_code);
+    lastWeather = `${name} ${t}°C ${w}`;
+    $("weatherResult").innerHTML = `<b>${name}</b><br>기온: ${t}°C<br>상태: ${w}`;
+  } catch (e) {
+    $("weatherResult").textContent = "날씨 조회 실패: " + e.message;
+  }
+};
+
+// ---- Firestore 저장 ----
+$("saveBtn").onclick = async () => {
+  $("saveErr").textContent = "";
+  const user = auth.currentUser;
+  if (!user) return;
+  if (!$("memo").value.trim()) { $("saveErr").textContent = "한 줄 기록을 입력하세요."; return; }
+  try {
+    await addDoc(collection(db, "users", user.uid, "moods"), {
+      mood: $("mood").value,
+      memo: $("memo").value.trim(),
+      weather: lastWeather || "날씨 미조회",
+      createdAt: serverTimestamp()
+    });
+    $("memo").value = "";
+  } catch (e) {
+    $("saveErr").textContent = "저장 실패: " + e.code;
+  }
+};
+
+// ---- Firestore 조회(실시간) & 삭제 ----
+function loadList(uid) {
+  const q = query(collection(db, "users", uid, "moods"), orderBy("createdAt", "desc"));
+  unsubscribe = onSnapshot(q, snap => {
+    const list = $("list");
+    list.innerHTML = "";
+    if (snap.empty) { list.textContent = "저장된 기록이 없습니다."; return; }
+    snap.forEach(d => {
+      const v = d.data();
+      const div = document.createElement("div");
+      div.className = "item";
+      const text = document.createElement("span");
+      text.textContent = `${v.mood} | ${v.memo} (${v.weather})`;
+      const btn = document.createElement("button");
+      btn.className = "del";
+      btn.textContent = "삭제";
+      btn.onclick = () => deleteDoc(doc(db, "users", uid, "moods", d.id));
+      div.append(text, btn);
+      list.appendChild(div);
+    });
+  });
+}
+</script>
+</body>
+</html>
